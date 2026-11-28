@@ -6,38 +6,20 @@ The project differentiates between 3 levels of contributors:
 - Collaborators (Triage): people with significant contributions, who may be responsible for some parts of the code, and are expected to maintain and review contributions for the code they own
 - Maintainers: responsible for reviewing and merging PRs, after approval from the code owners
 
-# AI Usage Policy
+# AI Usage
 
-> [!IMPORTANT]
->
-> AI-generated code is allowed. You are 100% responsible for every line, however it was produced.
->
-> Undisclosed AI usage may result in your account being permanently banned from contributing to the project.
->
-> Detailed information regarding permissible and restricted uses of AI can be found in the [AGENTS.md](AGENTS.md) file.
-
-If AI is used to generate any portion of the code, contributors must adhere to the following requirements:
-
-1. Explicitly disclose the manner in which AI was employed.
-2. Check for an existing PR addressing the same change; if one exists, comment there to work with its author instead of opening a duplicate.
-3. Perform a comprehensive manual review prior to submitting the pull request.
-4. Be prepared to explain every line of code they submitted when asked about it by a maintainer.
-5. It is strictly prohibited to use AI to write your posts for you (bug reports, feature requests, pull request descriptions, Github discussions, responding to humans, ...).
-
-For more info, please refer to the [AGENTS.md](AGENTS.md) file.
+If you use AI tools, see [AGENTS.md](AGENTS.md).
 
 # Pull requests (for contributors & collaborators)
 
 ### Before you start
 
-- Search for existing discussions and PRs first - duplicates will likely be closed without questions.
-- Features must begin with an issue, not a PR - let interest accumulate before writing code; niche features may only land as an example/tool, or on a private fork.
-- Bug-fix PRs must include a reproducible issue and a regression test that fails before your change and passes after. Fixes without a test may be closed without review.
-- New CLI or public API additions carry a **higher bar** than internal changes - justify why an existing mechanism doesn't suffice.
-- Meeting all of the above still doesn't guarantee a merge - see [Pull requests (for maintainers)](#pull-requests-for-maintainers).
+- Search for existing discussions and PRs first
+- Bug-fix PRs must include a reproducible issue and usually a regression test that fails before the change
+- Prefer simple and small PRs when possible
 - If you are a new contributor
-    - Limit your open PRs to 1
-    - Do not submit trivial fixes (e.g. typos, formatting changes)
+  - Limit your open PRs to 1
+  - Do not submit trivial fixes (e.g. typos, formatting changes)
 
 ### Preparing your PR
 

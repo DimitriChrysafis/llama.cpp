@@ -129,8 +129,9 @@ class LlamaModel(TextModel):
                 tokenizer_config_json = json.load(f)
                 if (add_prefix_space := tokenizer_config_json.get("add_prefix_space")) is not None:
                     self.gguf_writer.add_add_space_prefix(add_prefix_space)
-                if tokenizer_config_json.get("tokenizer_class") == "HybridDNATokenizer":
-                    return self._set_vocab_hybriddna()
+
+        if self._is_hybriddna():
+            return self._set_vocab_hybriddna()
 
         try:
             self._set_vocab_sentencepiece()
@@ -179,6 +180,18 @@ class LlamaModel(TextModel):
         return (weights.reshape(n_head, 2, weights.shape[0] // n_head // 2, *weights.shape[1:])
                 .swapaxes(1, 2)
                 .reshape(weights.shape))
+
+    def _transform_fp8_scale(self, name: str, scale: Tensor) -> tuple[Tensor, ...] | None:
+        if type(self).modify_tensors is not LlamaModel.modify_tensors:
+            return None
+        if self.undo_permute:
+            n_head = self.find_hparam(["n_heads", "num_attention_heads"])
+            n_kv_head = self.find_hparam(["n_kv_heads", "num_key_value_heads"])
+            if name.endswith("q_proj.weight"):
+                scale = self.permute(scale, n_head, n_head)
+            elif name.endswith("k_proj.weight"):
+                scale = self.permute(scale, n_head, n_kv_head)
+        return (scale,)
 
     def _repack_nvfp4(self, name: str, weight: Tensor, scale: Tensor, scale2: Tensor, input_scale: Tensor):
         # Mirror the BF16 Q/K RoPE permutation site in modify_tensors; the NVFP4 path bypasses it.

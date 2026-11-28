@@ -22,8 +22,13 @@ kernel void kernel_bin_fuse_impl(
 
     if (FC_RB) {
         // row broadcast
-        const uint i0 = tgpig.y*args.ne00 + tgpig.x;
-        const uint i1 = FC_CB ? tgpig.x%args.ne10 : tgpig.x;
+        const uint i = tgpig.x*ntg.x + tpitg.x;
+        if (i >= (uint) args.ne0) {
+            return;
+        }
+
+        const uint i0 = tgpig.y*args.ne00 + i;
+        const uint i1 = FC_CB ? i%args.ne10 : i;
 
         device const T0 * src0_row = (device const T0 *) (src0);
         device       T  * dst_row  = (device       T  *) (dst);
@@ -185,10 +190,47 @@ kernel void kernel_add_id(
 
     device       float * dst_row  = (device       float *)((device char *)dst  +  i1*nb1       + i2*nb2);
     device const float * src0_row = (device const float *)((device char *)src0 +  i1*args.nb01 + i2*args.nb02);
+
+    if (i11 == -1) {
+        for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+            dst_row[i0] = src0_row[i0];
+        }
+        return;
+    }
+
     device const float * src1_row = (device const float *)((device char *)src1 + i11*args.nb11);
 
     for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
         dst_row[i0] = src0_row[i0] + src1_row[i0];
+    }
+}
+
+kernel void kernel_mul_mat_scale(
+        constant ggml_metal_kargs_mul_mat_scale & args,
+        device const char * scale,
+        device const char * ids,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i1 = tgpig.x;
+    const int i2 = tgpig.y % args.ne2;
+    const int i3 = tgpig.y / args.ne2;
+
+    device const char * s = scale;
+
+    if (args.use_ids) {
+        const int32_t expert = *((device const int32_t *) (ids + i1*args.ids_nb0 + i2*args.ids_nb1));
+        if (expert < 0) {
+            return;
+        }
+        s += expert*args.s_nb1;
+    }
+
+    device float * dst_row = (device float *) (dst + i1*args.nb1 + i2*args.nb2 + i3*args.nb3);
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        dst_row[i0] *= *((device const float *) (s + i0*args.s_nb0));
     }
 }
 

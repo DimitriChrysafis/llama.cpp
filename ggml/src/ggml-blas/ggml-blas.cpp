@@ -330,6 +330,8 @@ static const char * ggml_backend_blas_device_get_description(ggml_backend_dev_t 
         return "Accelerate";
     #elif defined(GGML_BLAS_USE_MKL)
         return "MKL";
+    #elif defined(GGML_BLAS_USE_AOCL)
+        return "AOCL-BLAS";
     #elif defined(GGML_BLAS_USE_BLIS)
         return "BLIS";
     #elif defined(GGML_BLAS_USE_NVPL)
@@ -368,6 +370,7 @@ static void ggml_backend_blas_device_get_props(ggml_backend_dev_t dev, struct gg
         /* .buffer_from_host_ptr  = */ true,
         /* .events                = */ false,
         /* .mmap_support          = */ true,
+        /* .fast_async_host_input = */ false,
     };
 }
 
@@ -394,6 +397,10 @@ static ggml_backend_buffer_t ggml_backend_blas_device_buffer_from_host_ptr(ggml_
 static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+
+    if (ggml_get_src_scale(op, 0)) {
+        return false;
+    }
 
     switch (op->op) {
         case GGML_OP_NONE:

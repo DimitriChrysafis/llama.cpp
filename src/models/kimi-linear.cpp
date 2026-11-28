@@ -19,7 +19,7 @@ void llama_model_kimi_linear::load_arch_hparams(llama_model_loader & ml) {
     }
 
     // MoE parameters - Kimi uses moe_intermediate_size = 1024
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
@@ -84,9 +84,9 @@ void llama_model_kimi_linear::load_arch_tensors(llama_model_loader &) {
              layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
 
              // A_log - Shape in GGUF: [1, num_heads, 1, 1] (4D) or [1, num_heads] (2D after quantization) Note: -exp(A_log) is applied in convert_hf_to_gguf.py
-             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head, 1, 1}, TENSOR_NOT_REQUIRED);
+             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {1, n_head, 1, 1}, TENSOR_NOT_REQUIRED);
              if (!layer.ssm_a) {
-                 layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head}, 0);
+                 layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, i), {1, n_head}, 0);
              }
 
              // dt_bias - shape [n_embd_head_k_kda * n_head] = [4096]
@@ -137,7 +137,7 @@ void llama_model_kimi_linear::load_arch_tensors(llama_model_loader &) {
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
         // MoE intermediate size (different from dense FFN)
-        const int64_t n_ff_exp = hparams.n_ff_exp;
+        const int64_t n_ff_exp = hparams.n_ff_exp();
 
         // Kimi uses n_layer_dense_lead to determine which layers use dense FFN vs MoE
         // first_k_dense_replace = 1 means layer 0 uses dense FFN, layers 1+ use MoE
@@ -167,12 +167,12 @@ void llama_model_kimi_linear::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_kimi_linear::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
 // Causal Conv1d function for Q,K,V
 // When qkv is 0, it is Q, 1 is K, 2 is V
-static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_tensor * conv_states_all, ggml_tensor * conv_state_all, int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w, int64_t d_conv, int64_t head_dim, int64_t n_head, int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head) {
+static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_tensor * conv_states_all, ggml_tensor * conv_state_all, int64_t qkv, ggml_tensor * x_proj, ggml_tensor * conv_w, int64_t d_conv, int64_t head_dim, int64_t n_head, int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head) {
     const int64_t d_inner = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
     const int64_t n_embd_r_total = 3 * conv_state_size;  // Q + K + V
@@ -194,9 +194,6 @@ static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_t
 
 // Causal Conv1d function for Q,K,V
 // When qkv is 0, it is Q, 1 is K, 2 is V
-    // Step 1: Q, K, V projections -> [d_inner, n_tokens]
-    ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
-
     // Reshape input: {d_inner, n_tokens} -> {d_inner, n_seq_tokens, n_seqs}
     ggml_tensor * x_3d = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
 
@@ -231,8 +228,8 @@ static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_t
     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
 
-llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph_params & params) :
-    llm_build_delta_net_base(params), model(model) {
+llama_model_kimi_linear::graph::graph(const llm_graph_params & params) :
+    llm_build_delta_net_base(params) {
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -295,13 +292,26 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
             cb(conv_states_all, "conv_states_all", il);
             ggml_tensor * conv_state_all = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
-            ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
-            ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
-            ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
+            ggml_tensor * q_in, * k_in, * v_in;
+            if (layer.wqkv) {
+                ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur);
+                const int64_t d_inner = head_dim * n_head;
+                const size_t esize = ggml_element_size(qkv);
+                q_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], 0));
+                k_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], d_inner * esize));
+                v_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], 2 * d_inner * esize));
+            } else {
+                q_in = build_lora_mm(layer.wq, cur);
+                k_in = build_lora_mm(layer.wk, cur);
+                v_in = build_lora_mm(layer.wv, cur);
+            }
+            ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, q_in, layer.ssm_q_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
+            ggml_tensor * Kcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, k_in, layer.ssm_k_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
+            ggml_tensor * Vcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, v_in, layer.ssm_v_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);
 
             // g1 = -exp(A_log) * softplus(f_b(f_a(x)) + dt_bias)
-            ggml_tensor * f_a = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
-            ggml_tensor * g1 = ggml_mul_mat(ctx0, layer.ssm_f_b, f_a);
+            ggml_tensor * f_a = build_lora_mm(layer.ssm_f_a, cur);
+            ggml_tensor * g1 = build_lora_mm(layer.ssm_f_b, f_a);
             cb(g1, "g1 f_b(f_a(cur))", il);
             g1 = ggml_add(ctx0, g1, layer.ssm_dt_b);
             g1 = ggml_softplus(ctx0, g1);
@@ -316,7 +326,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             g1 = ggml_reshape_4d(ctx0, g1, head_dim, n_head, n_seq_tokens, n_seqs);
 
             // Compute beta (mixing coefficient)
-            ggml_tensor * beta = ggml_mul_mat(ctx0, layer.ssm_beta, cur);
+            ggml_tensor * beta = build_lora_mm(layer.ssm_beta, cur);
             beta = ggml_reshape_4d(ctx0, beta, 1, n_head, n_seq_tokens, n_seqs);
             cb(beta, "kda_beta", il);
 
@@ -331,13 +341,13 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
             state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head, n_seqs);
 
+
             const float eps_norm = hparams.f_norm_rms_eps;
 
-            Qcur = ggml_l2_norm(ctx0, Qcur, eps_norm);
-            Kcur = ggml_l2_norm(ctx0, Kcur, eps_norm);
+            Qcur = build_gdn_l2_norm(ctx0, Qcur, eps_norm);
+            Kcur = build_gdn_l2_norm(ctx0, Kcur, eps_norm);
 
-            // Choose between build_delta_net_chunking and build_delta_net_recurrent based on n_tokens
-            auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);
+            auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state);
 
             ggml_tensor * output = ggml_cont(ctx0, attn_out.first);
             ggml_tensor * new_state = attn_out.second;
@@ -352,8 +362,8 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
             // Output gating g2 = g_b(g_a(x))
             ggml_tensor * cur_2d = ggml_reshape_2d(ctx0, cur, cur->ne[0], n_seq_tokens * n_seqs);
-            ggml_tensor * g_a = ggml_mul_mat(ctx0, layer.ssm_g_a, cur_2d);
-            ggml_tensor * g2 = ggml_mul_mat(ctx0, layer.ssm_g_b, g_a);
+            ggml_tensor * g_a = build_lora_mm(layer.ssm_g_a, cur_2d);
+            ggml_tensor * g2 = build_lora_mm(layer.ssm_g_b, g_a);
             cb(g2, "g2 g_b(g_a(cur_2d))", il);
             g2 = ggml_reshape_3d(ctx0, g2, head_dim, n_head, n_seq_tokens * n_seqs);
 
@@ -368,7 +378,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
             // Output projection
             gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
-            cur = ggml_mul_mat(ctx0, layer.wo, gated);
+            cur = build_lora_mm(layer.wo, gated);
             cb(cur, "kda_out", il);
 
         } else {
@@ -377,11 +387,11 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             // Step 1: Q projection and reshape
             // vLLM Kimi: q = q_proj(hidden_states), then view as [n_tokens, n_head, qk_head_dim]
             // Note: Kimi MLA does NOT use RoPE (rotary_emb=None in vLLM)
-            ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.wq, cur);
+            ggml_tensor * Qcur = build_lora_mm(layer.wq, cur);
 
             // Step 2: KV compression
             // kv_cmpr_pe = kv_a_proj_with_mqa(hidden_states) -> [kv_lora_rank + qk_rope_head_dim, n_tokens]
-            ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+            ggml_tensor * kv_cmpr_pe = build_lora_mm(layer.wkv_a_mqa, cur);
 
             // Split: kv_cmpr = kv_lora[:kv_lora_rank], k_pe = kv_lora[kv_lora_rank:]
             ggml_tensor * kv_cmpr = ggml_view_2d(ctx0, kv_cmpr_pe, kv_lora_rank, n_tokens,
@@ -413,7 +423,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 cb(q_nope, "q_nope_perm", il);
 
                 // {n_embd_head_qk_nope, kv_lora_rank, n_head} x {n_embd_head_qk_nope, n_tokens, n_head}
-                ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0, layer.wk_b, q_nope);
+                ggml_tensor * q_nope_absorbed = build_lora_mm(layer.wk_b, q_nope);
                 cb(q_nope_absorbed, "q_nope_absorbed", il);
 
                 // {kv_lora_rank, n_head, n_tokens}
@@ -436,13 +446,13 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 ggml_tensor * Vcur = kv_cmpr;
                 cb(Vcur, "Vcur", il);
 
-                cur = build_attn(inp_attn_k, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale_mla, il);
+                cur = build_attn(inp_attn_k, layer.wo, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, layer.wv_b, kq_scale_mla, il);
                 cb(cur, "mla_out", il);
             } else { // MLA KV cache disabled. Fall back to MHA KV cache.
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head_k_mla, n_head, n_tokens);
                 cb(Qcur, "mla_Q", il);
                 // KV decompression: kv = kv_b_proj(kv_c_normed)
-                ggml_tensor * kv = ggml_mul_mat(ctx0, layer.wkv_b, kv_cmpr);
+                ggml_tensor * kv = build_lora_mm(layer.wkv_b, kv_cmpr);
                 const int64_t kv_per_head = n_embd_head_qk_nope + n_embd_head_v_mla;
 
                 // Split kv into k_nope and v
@@ -467,7 +477,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
 
                 // Direct softmax attention (with MHA KV cache)
                 // Use build_attn with inp_attn for proper mask handling
-                cur = build_attn(inp_attn_kv, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale_mla, il);
+                cur = build_attn(inp_attn_kv, layer.wo, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale_mla, il);
                 cb(cur, "mla_out", il);
             }
         }
@@ -489,9 +499,9 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             // Dense FFN layer
             cur = build_ffn(cur,
-                layer.ffn_up, NULL, NULL,
-                layer.ffn_gate, NULL, NULL,
-                layer.ffn_down, NULL, NULL,
+                layer.ffn_up, NULL,
+                layer.ffn_gate, NULL,
+                layer.ffn_down, NULL,
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else {
@@ -504,7 +514,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 layer.ffn_down_exps,
                 layer.ffn_exp_probs_b,
                 hparams.n_expert,
-                hparams.n_expert_used,
+                hparams.n_expert_used(),
                 LLM_FFN_SILU, true,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
@@ -514,9 +524,9 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             // Shared expert
             {
                 ggml_tensor * ffn_shexp = build_ffn(cur,
-                        layer.ffn_up_shexp, NULL, NULL,
-                        layer.ffn_gate_shexp, NULL, NULL,
-                        layer.ffn_down_shexp, NULL, NULL,
+                        layer.ffn_up_shexp, NULL,
+                        layer.ffn_gate_shexp, NULL,
+                        layer.ffn_down_shexp, NULL,
                         NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cb(ffn_shexp, "ffn_shexp", il);
 
@@ -542,9 +552,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
     res->t_embd = cur;
 
     // Output
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

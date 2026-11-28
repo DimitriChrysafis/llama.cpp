@@ -79,9 +79,7 @@ static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, cons
     float state[head_size];
     __shared__ float _r[head_size], _w[head_size], _k[head_size], _a[head_size], _b[head_size];
 
-#ifndef GGML_USE_MUSA
     #pragma unroll
-#endif
     for (int i = 0; i < head_size; i++) {
         state[i] = s[batch_i * state_size + head_i * head_size * head_size + tid * head_size + i];
     }
@@ -182,7 +180,7 @@ rwkv_wkv7_f32_t1_warp_row(const int T, const int C, const int H, const float * r
     const float vt  = v[t];
     const float st0 = s0 * _w[lane]             + _k[lane]             * vt + sa * _b[lane];
     const float st1 = s1 * _w[lane + half_head] + _k[lane + half_head] * vt + sa * _b[lane + half_head];
-    const float y   = warp_reduce_sum(st0 * _r[lane] + st1 * _r[lane + half_head]);
+    const float y   = warp_reduce_sum<WARP_SIZE, true>(st0 * _r[lane] + st1 * _r[lane + half_head]);
 
     dst[T * C + state_base + lane]             = st0;
     dst[T * C + state_base + lane + half_head] = st1;

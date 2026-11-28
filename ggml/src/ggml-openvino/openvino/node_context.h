@@ -16,22 +16,18 @@ typedef std::map<std::string, Output<Node>> TensorMap;
 
 class NodeContext : public frontend::NodeContext {
 public:
-    NodeContext(const std::shared_ptr<GgmlDecoder> & decoder,
-                std::shared_ptr<TensorMap> & tensor_map,
-                int node_idx,
-                TranslateSession * translate_session = nullptr) :
+    NodeContext(const std::shared_ptr<GgmlDecoder> & decoder, std::shared_ptr<TensorMap> & tensor_map, int node_idx) :
         ov::frontend::NodeContext(decoder->get_op_type(node_idx)),
         m_decoder(decoder),
         m_tensor_map(tensor_map),
-        m_node_idx(node_idx),
-        m_translate_session(translate_session) {
+        m_node_idx(node_idx) {
         m_input_names = decoder->get_input_names(m_node_idx);
         m_output_names = decoder->get_output_names(m_node_idx);
     }
 
-    TranslateSession * get_translate_session() const { return m_translate_session; }
-
     const std::vector<std::string> & get_input_names() const { return m_input_names; }
+
+    const std::vector<std::string> & get_output_names() const { return m_output_names; }
 
     size_t get_input_size() const override { return m_decoder->get_input_size(m_node_idx); }
 
@@ -105,6 +101,8 @@ public:
 
     size_t get_output_op_offset() const { return m_decoder->get_output_op_offset(m_node_idx); }
 
+    std::string get_inplace_op_src() const { return m_decoder->get_inplace_op_src(m_node_idx); }
+
     ov::element::Type get_output_type() const { return m_decoder->get_output_type(m_node_idx); }
 
     std::vector<size_t> get_output_stride() const { return m_decoder->get_output_stride(m_node_idx); }
@@ -120,7 +118,10 @@ public:
             auto view_it = m_tensor_map->find(m_input_names[idx]);
             if (!base_name.empty() && view_it != m_tensor_map->end()) {
                 auto base_it = m_tensor_map->find(base_name);
-                if (base_it != m_tensor_map->end() &&
+                // A multi-output translator can publish a VIEW directly without materializing
+                // its packed parent (GatedDeltaNet attention/state). In that case the VIEW is the
+                // authoritative value. The node comparison retains the existing resolved-VIEW path.
+                if (base_it == m_tensor_map->end() ||
                     view_it->second.get_node_shared_ptr() != base_it->second.get_node_shared_ptr()) {
                     return view_it->second;
                 }
@@ -143,6 +144,10 @@ public:
 
     bool has_input(const std::string & name) const { return m_tensor_map->find(name) != m_tensor_map->end(); }
 
+    void put_shared(const std::string & name, const Output<Node> & value) const {
+        m_tensor_map->insert({name, value});
+    }
+
     const std::string & get_name() const override { return m_decoder->get_op_name(m_node_idx); }
 
     ov::Any get_attribute_as_any(const std::string & name) const override { return m_decoder->get_attribute(name); }
@@ -153,13 +158,14 @@ public:
 
     bool is_stateful() const { return m_decoder->is_stateful(); }
 
+    bool is_prefill() const { return m_decoder->is_prefill(); }
+
     int get_ssm_state_size() const { return m_decoder->get_ssm_state_size(); }
 
 private:
     std::shared_ptr<GgmlDecoder> m_decoder;
     std::shared_ptr<TensorMap> & m_tensor_map;
     int m_node_idx;
-    TranslateSession * m_translate_session;
     std::vector<std::string> m_input_names;
     std::vector<std::string> m_output_names;
 };

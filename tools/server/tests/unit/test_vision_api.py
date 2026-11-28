@@ -6,8 +6,8 @@ import requests
 server: ServerProcess
 
 def get_img_url(id: str) -> str:
-    IMG_URL_0 = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png"
-    IMG_URL_1 = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/91_cat.png"
+    IMG_URL_0 = "https://huggingface.co/ggml-org-dev/tinygemma3-GGUF/resolve/main/test/11_truck.png"
+    IMG_URL_1 = "https://huggingface.co/ggml-org-dev/tinygemma3-GGUF/resolve/main/test/91_cat.png"
     if id == "IMG_URL_0":
         return IMG_URL_0
     elif id == "IMG_URL_1":
@@ -39,6 +39,9 @@ def create_server():
     global server
     os.environ['LLAMA_MEDIA_MARKER'] = '<__media__>'
     server = ServerPreset.tinygemma3()
+    # the test images are on huggingface.co, which resolves to a private address on runners inside the HF network
+    # test_vision_image_url_private_address covers the private address check
+    server.media_allow_private_urls = True
 
 def test_models_supports_multimodal_capability():
     global server
@@ -71,6 +74,7 @@ def test_v1_models_supports_multimodal_capability():
         ("What is this:\n", "malformed",              False, None),
         ("What is this:\n", "https://google.com/404", False, None), # non-existent image
         ("What is this:\n", "https://ggml.ai",        False, None), # non-image data
+        ("What is this:\n", "data:text/html;base64,aGVsbG8=", False, None), # unsupported data uri mime
         # TODO @ngxson : test with multiple images, no images and with audio
     ]
 )
@@ -178,3 +182,113 @@ def test_vision_embeddings(prompt, image_data, success):
         assert content[0]['embedding'] != content[2]['embedding']
     else:
         assert res.status_code != 200
+
+
+def test_vision_embeddings_oai_content():
+    global server
+    server.server_embeddings = True
+    server.pooling = 'mean'
+    server.n_batch = 512
+    server.start()
+    res = server.make_request("POST", "/v1/embeddings", data={
+        "input": [
+            {"content": [
+                {"type": "text", "text": "What is this: "},
+                {"type": "image_url", "image_url": {"url": get_img_url("IMG_BASE64_URI_0")}},
+                {"type": "text", "text": "\n"},
+            ]},
+            {JSON_PROMPT_STRING_KEY: "What is this: <__media__>\n", JSON_MULTIMODAL_KEY: [get_img_url("IMG_BASE64_0")]},
+            "What is this: \n",
+        ],
+    })
+    assert res.status_code == 200
+    data = res.body["data"]
+    assert len(data) == 3
+    # same prompt and image in both formats
+    assert data[0]["embedding"] == data[1]["embedding"]
+    assert data[0]["embedding"] != data[2]["embedding"]
+
+
+@pytest.mark.parametrize("allow_private", [False, True])
+def test_vision_image_url_private_address(allow_private: bool):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    img = requests.get(get_img_url("IMG_URL_0")).content
+
+    class ImageHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            self.wfile.write(img)
+
+        def log_message(self, format, *args):
+            pass
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), ImageHandler)
+    threading.Thread(target=target.serve_forever, daemon=True).start()
+    try:
+        global server
+        server.media_allow_private_urls = allow_private
+        server.start()
+        res = server.make_request("POST", "/chat/completions", data={
+            "temperature": 0.0,
+            "top_k": 1,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "What is this:\n"},
+                    {"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{target.server_port}/img.png"}},
+                ]},
+            ],
+        })
+        assert res.status_code == (200 if allow_private else 400)
+    finally:
+        target.shutdown()
+        target.server_close()
+
+
+def get_ocr_image_part(name: str) -> dict:
+    response = requests.get(f"https://huggingface.co/ggml-org-dev/small-test/resolve/main/test/{name}.png")
+    response.raise_for_status()
+    return {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(response.content).decode("utf-8")}}
+
+
+@pytest.mark.parametrize("name,text", [("hello_world", "HELLO WORLD"), ("invoice_2026", "Invoice 2026")])
+def test_vision_ocr(name: str, text: str):
+    # small-test reads black text on white in a common truetype font, the kind of image it is trained on
+    global server
+    server = ServerPreset.small_test()
+    server.start()
+    body = server.make_any_request("POST", "/v1/chat/completions", data={
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [
+            get_ocr_image_part(name),
+            {"type": "text", "text": "What is written in this image?"},
+        ]}],
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+    })
+    content = body["choices"][0]["message"]["content"]
+    assert text.lower() in content.lower(), f"expected {text!r} in {content!r}"
+
+
+def test_vision_ocr_two_images():
+    # both images in one message: small-test is trained on one image per message, so it only reads the year of the second one
+    # "2026" is only in the second image, which proves that both images reach the model
+    global server
+    server = ServerPreset.small_test()
+    server.start()
+    body = server.make_any_request("POST", "/v1/chat/completions", data={
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": [
+            get_ocr_image_part("hello_world"),
+            get_ocr_image_part("invoice_2026"),
+            {"type": "text", "text": "What is written in these two images?"},
+        ]}],
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+    })
+    content = body["choices"][0]["message"]["content"].lower()
+    assert "hello world" in content and "2026" in content, f"expected the text of both images in {content!r}"
